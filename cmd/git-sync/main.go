@@ -30,6 +30,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -61,7 +62,7 @@ var flSubmodules = flag.String("submodules", envString("GIT_SYNC_SUBMODULES", "r
 var flRoot = flag.String("root", envString("GIT_SYNC_ROOT", envString("HOME", "")+"/git"),
 	"the root directory for git-sync operations, under which --dest will be created")
 var flDest = flag.String("dest", envString("GIT_SYNC_DEST", ""),
-	"the name of (a symlink to) a directory in which to check-out files under --root (defaults to the leaf dir of --repo)")
+	"the path (absolute or relative to --root) at which to create a symlink to the directory holding the checked-out files (defaults to the leaf dir of --repo)")
 var flErrorFile = flag.String("error-file", envString("GIT_SYNC_ERROR_FILE", ""),
 	"the name of a file into which errors will be written under --root (defaults to \"\", disabling error reporting)")
 var flWait = flag.Float64("wait", envFloat("GIT_SYNC_WAIT", 1),
@@ -87,7 +88,7 @@ var flSparseCheckoutFile = flag.String("sparse-checkout-file", envString("GIT_SY
 	"the path to a sparse-checkout file.")
 
 var flWebhookURL = flag.String("webhook-url", envString("GIT_SYNC_WEBHOOK_URL", ""),
-	"the URL for a webhook notification when syncs complete (default is no webook)")
+	"the URL for a webhook notification when syncs complete (default is no webhook)")
 var flWebhookMethod = flag.String("webhook-method", envString("GIT_SYNC_WEBHOOK_METHOD", "POST"),
 	"the HTTP method for the webhook")
 var flWebhookStatusSuccess = flag.Int("webhook-success-status", envInt("GIT_SYNC_WEBHOOK_SUCCESS_STATUS", 200),
@@ -125,6 +126,8 @@ var flGitCmd = flag.String("git", envString("GIT_SYNC_GIT", "git"),
 	"the git command to run (subject to PATH search, mostly for testing)")
 var flGitConfig = flag.String("git-config", envString("GIT_SYNC_GIT_CONFIG", ""),
 	"additional git config options in 'key1:val1,key2:val2' format")
+var flGitGC = flag.String("git-gc", envString("GIT_SYNC_GIT_GC", "auto"),
+	"git garbage collection behavior: one of 'auto', 'always', 'aggressive', or 'off'")
 
 var flHTTPBind = flag.String("http-bind", envString("GIT_SYNC_HTTP_BIND", ""),
 	"the bind address (including port) for git-sync's HTTP endpoint")
@@ -168,6 +171,11 @@ const (
 	submodulesRecursive = "recursive"
 	submodulesShallow   = "shallow"
 	submodulesOff       = "off"
+
+	gcAuto       = "auto"
+	gcAlways     = "always"
+	gcAggressive = "aggressive"
+	gcOff        = "off"
 )
 
 func init() {
@@ -277,6 +285,12 @@ func main() {
 		handleError(true, "ERROR: --submodules must be one of %q, %q, or %q", submodulesRecursive, submodulesShallow, submodulesOff)
 	}
 
+	switch *flGitGC {
+	case gcAuto, gcAlways, gcAggressive, gcOff:
+	default:
+		handleError(true, "ERROR: --git-gc must be one of %q, %q, %q, or %q", gcAuto, gcAlways, gcAggressive, gcOff)
+	}
+
 	if *flRoot == "" {
 		handleError(true, "ERROR: --root must be specified")
 	}
@@ -285,9 +299,8 @@ func main() {
 		parts := strings.Split(strings.Trim(*flRepo, "/"), "/")
 		*flDest = parts[len(parts)-1]
 	}
-
-	if strings.Contains(*flDest, "/") {
-		handleError(true, "ERROR: --dest must be a leaf name, not a path")
+	if !filepath.IsAbs(*flDest) {
+		*flDest = filepath.Join(*flRoot, *flDest)
 	}
 
 	if *flWait < 0 {
@@ -408,6 +421,12 @@ func main() {
 		askpassCount.WithLabelValues(metricKeySuccess).Inc()
 	}
 
+	// Set additional configs we want, but users might override.
+	if err := setupDefaultGitConfigs(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: can't set default git configs: %v\n", err)
+		os.Exit(1)
+	}
+
 	// This needs to be after all other git-related config flags.
 	if *flGitConfig != "" {
 		if err := setupExtraGitConfigs(ctx, *flGitConfig); err != nil {
@@ -468,6 +487,7 @@ func main() {
 			*flWebhookBackoff,
 			hook.NewHookData(),
 			log,
+			*flOneTime,
 		)
 		go webhookRunner.Run(context.Background())
 	}
@@ -488,6 +508,7 @@ func main() {
 			*flExechookBackoff,
 			hook.NewHookData(),
 			log,
+			*flOneTime,
 		)
 		go exechookRunner.Run(context.Background())
 	}
@@ -511,22 +532,42 @@ func main() {
 			cancel()
 			time.Sleep(waitTime(*flWait))
 			continue
-		} else if changed {
-			if webhookRunner != nil {
-				webhookRunner.Send(hash)
-			}
-			if exechookRunner != nil {
-				exechookRunner.Send(hash)
-			}
-			updateSyncMetrics(metricKeySuccess, start)
 		} else {
-			updateSyncMetrics(metricKeyNoOp, start)
+			// this might have been called before, but also might not have
+			setRepoReady()
+			if changed {
+				if webhookRunner != nil {
+					webhookRunner.Send(hash)
+				}
+				if exechookRunner != nil {
+					exechookRunner.Send(hash)
+				}
+				updateSyncMetrics(metricKeySuccess, start)
+			} else {
+				updateSyncMetrics(metricKeyNoOp, start)
+			}
 		}
 
 		if initialSync {
+			// Determine if git-sync should terminate for one of several reasons
 			if *flOneTime {
+				// Wait for hooks to complete at least once, if not nil, before
+				// checking whether to stop program.
+				// Assumes that if hook channels are not nil, they will have at
+				// least one value before getting closed
+				exitCode := 0 // is 0 if all hooks succeed, else is 1
+				if exechookRunner != nil {
+					if err := exechookRunner.WaitForCompletion(); err != nil {
+						exitCode = 1
+					}
+				}
+				if webhookRunner != nil {
+					if err := webhookRunner.WaitForCompletion(); err != nil {
+						exitCode = 1
+					}
+				}
 				log.DeleteErrorFile()
-				os.Exit(0)
+				os.Exit(exitCode)
 			}
 			if isHash, err := revIsHash(ctx, *flRev, *flRoot); err != nil {
 				log.Error(err, "can't tell if rev is a git hash, exiting", "rev", *flRev)
@@ -545,6 +586,25 @@ func main() {
 		cancel()
 		time.Sleep(waitTime(*flWait))
 	}
+}
+
+func removeDirContents(dir string, log *logging.Logger) error {
+	dirents, err := ioutil.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+
+	for _, fi := range dirents {
+		p := filepath.Join(dir, fi.Name())
+		if log != nil {
+			log.V(2).Info("removing path recursively", "path", p, "isDir", fi.IsDir())
+		}
+		if err := os.RemoveAll(p); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func updateSyncMetrics(key string, start time.Time) {
@@ -580,6 +640,10 @@ func handleError(printUsage bool, format string, a ...interface{}) {
 // Put the current UID/GID into /etc/passwd so SSH can look it up.  This
 // assumes that we have the permissions to write to it.
 func addUser() error {
+	// Skip if the UID already exists. The Dockerfile already adds the default UID/GID.
+	if _, err := user.LookupId(strconv.Itoa(os.Getuid())); err == nil {
+		return nil
+	}
 	home := os.Getenv("HOME")
 	if home == "" {
 		cwd, err := os.Getwd()
@@ -604,28 +668,36 @@ func addUser() error {
 // directory and cleans up the previous worktree.  If there was a previous
 // worktree, this returns the path to it.
 func updateSymlink(ctx context.Context, gitRoot, link, newDir string) (string, error) {
+	linkDir, linkFile := filepath.Split(link)
+
+	// Make sure the link directory exists. We do this here, rather than at
+	// startup because it might be under --root and that gets wiped in some
+	// circumstances.
+	if err := os.MkdirAll(filepath.Dir(linkDir), os.FileMode(int(0755))); err != nil {
+		return "", fmt.Errorf("error making symlink dir: %v", err)
+	}
+
 	// Get currently-linked repo directory (to be removed), unless it doesn't exist
-	linkPath := filepath.Join(gitRoot, link)
-	oldWorktreePath, err := filepath.EvalSymlinks(linkPath)
+	oldWorktreePath, err := filepath.EvalSymlinks(link)
 	if err != nil && !os.IsNotExist(err) {
 		return "", fmt.Errorf("error accessing current worktree: %v", err)
 	}
 
 	// newDir is absolute, so we need to change it to a relative path.  This is
 	// so it can be volume-mounted at another path and the symlink still works.
-	newDirRelative, err := filepath.Rel(gitRoot, newDir)
+	newDirRelative, err := filepath.Rel(linkDir, newDir)
 	if err != nil {
 		return "", fmt.Errorf("error converting to relative path: %v", err)
 	}
 
 	const tmplink = "tmp-link"
-	log.V(1).Info("creating tmp symlink", "root", gitRoot, "dst", newDirRelative, "src", tmplink)
-	if _, err := cmdRunner.Run(ctx, gitRoot, "ln", "-snf", newDirRelative, tmplink); err != nil {
+	log.V(1).Info("creating tmp symlink", "root", linkDir, "dst", newDirRelative, "src", tmplink)
+	if _, err := cmdRunner.Run(ctx, linkDir, nil, "ln", "-snf", newDirRelative, tmplink); err != nil {
 		return "", fmt.Errorf("error creating symlink: %v", err)
 	}
 
-	log.V(1).Info("renaming symlink", "root", gitRoot, "old_name", tmplink, "new_name", link)
-	if _, err := cmdRunner.Run(ctx, gitRoot, "mv", "-T", tmplink, link); err != nil {
+	log.V(1).Info("renaming symlink", "root", linkDir, "old_name", tmplink, "new_name", linkFile)
+	if _, err := cmdRunner.Run(ctx, linkDir, nil, "mv", "-T", tmplink, linkFile); err != nil {
 		return "", fmt.Errorf("error replacing symlink: %v", err)
 	}
 
@@ -654,24 +726,24 @@ func cleanupWorkTree(ctx context.Context, gitRoot, worktree string) error {
 	log.V(1).Info("removing worktree", "path", worktree)
 	if err := os.RemoveAll(worktree); err != nil {
 		return fmt.Errorf("error removing directory: %v", err)
-	} else if _, err := cmdRunner.Run(ctx, gitRoot, *flGitCmd, "worktree", "prune"); err != nil {
+	} else if _, err := cmdRunner.Run(ctx, gitRoot, nil, *flGitCmd, "worktree", "prune"); err != nil {
 		return err
 	}
 	return nil
 }
 
 // addWorktreeAndSwap creates a new worktree and calls updateSymlink to swap the symlink to point to the new worktree
-func addWorktreeAndSwap(ctx context.Context, gitRoot, dest, branch, rev string, depth int, hash string, submoduleMode string) error {
+func addWorktreeAndSwap(ctx context.Context, repo, gitRoot, dest, branch, rev string, depth int, hash string, submoduleMode string) error {
 	log.V(0).Info("syncing git", "rev", rev, "hash", hash)
 
 	args := []string{"fetch", "-f", "--tags"}
 	if depth != 0 {
 		args = append(args, "--depth", strconv.Itoa(depth))
 	}
-	args = append(args, "origin", branch)
+	args = append(args, repo, branch)
 
 	// Update from the remote.
-	if _, err := cmdRunner.Run(ctx, gitRoot, *flGitCmd, args...); err != nil {
+	if _, err := cmdRunner.Run(ctx, gitRoot, nil, *flGitCmd, args...); err != nil {
 		return err
 	}
 
@@ -696,14 +768,9 @@ func addWorktreeAndSwap(ctx context.Context, gitRoot, dest, branch, rev string, 
 		return err
 	}
 
-	_, err := cmdRunner.Run(ctx, gitRoot, *flGitCmd, "worktree", "add", "--detach", worktreePath, hash, "--no-checkout")
+	_, err := cmdRunner.Run(ctx, gitRoot, nil, *flGitCmd, "worktree", "add", "--detach", worktreePath, hash, "--no-checkout")
 	log.V(0).Info("adding worktree", "path", worktreePath, "branch", fmt.Sprintf("origin/%s", branch))
 	if err != nil {
-		return err
-	}
-
-	// GC clone
-	if _, err := cmdRunner.Run(ctx, gitRoot, *flGitCmd, "gc", "--prune=all"); err != nil {
 		return err
 	}
 
@@ -753,13 +820,13 @@ func addWorktreeAndSwap(ctx context.Context, gitRoot, dest, branch, rev string, 
 		}
 
 		args := []string{"sparse-checkout", "init"}
-		_, err = cmdRunner.Run(ctx, worktreePath, *flGitCmd, args...)
+		_, err = cmdRunner.Run(ctx, worktreePath, nil, *flGitCmd, args...)
 		if err != nil {
 			return err
 		}
 	}
 
-	_, err = cmdRunner.Run(ctx, worktreePath, *flGitCmd, "reset", "--hard", hash)
+	_, err = cmdRunner.Run(ctx, worktreePath, nil, *flGitCmd, "reset", "--hard", hash)
 	if err != nil {
 		return err
 	}
@@ -776,7 +843,7 @@ func addWorktreeAndSwap(ctx context.Context, gitRoot, dest, branch, rev string, 
 		if depth != 0 {
 			submodulesArgs = append(submodulesArgs, "--depth", strconv.Itoa(depth))
 		}
-		_, err = cmdRunner.Run(ctx, worktreePath, *flGitCmd, submodulesArgs...)
+		_, err = cmdRunner.Run(ctx, worktreePath, nil, *flGitCmd, submodulesArgs...)
 		if err != nil {
 			return err
 		}
@@ -786,7 +853,7 @@ func addWorktreeAndSwap(ctx context.Context, gitRoot, dest, branch, rev string, 
 	if *flChmod != 0 {
 		mode := fmt.Sprintf("%#o", *flChmod)
 		log.V(0).Info("changing file permissions", "mode", mode)
-		_, err = cmdRunner.Run(ctx, "", "chmod", "-R", mode, worktreePath)
+		_, err = cmdRunner.Run(ctx, "", nil, "chmod", "-R", mode, worktreePath)
 		if err != nil {
 			return err
 		}
@@ -800,37 +867,74 @@ func addWorktreeAndSwap(ctx context.Context, gitRoot, dest, branch, rev string, 
 	setRepoReady()
 
 	// From here on we have to save errors until the end.
+	var cleanupErrs multiError
 
 	// Clean up previous worktree(s).
-	var cleanupErr error
 	if oldWorktree != "" {
-		cleanupErr = cleanupWorkTree(ctx, gitRoot, oldWorktree)
+		if err := cleanupWorkTree(ctx, gitRoot, oldWorktree); err != nil {
+			cleanupErrs = append(cleanupErrs, err)
+		}
 	}
 
-	if cleanupErr != nil {
-		return cleanupErr
+	// Run GC if needed.
+	if *flGitGC != gcOff {
+		args := []string{"gc"}
+		switch *flGitGC {
+		case gcAuto:
+			args = append(args, "--auto")
+		case gcAlways:
+			// no extra flags
+		case gcAggressive:
+			args = append(args, "--aggressive")
+		}
+		if _, err := cmdRunner.Run(ctx, gitRoot, nil, *flGitCmd, args...); err != nil {
+			cleanupErrs = append(cleanupErrs, err)
+		}
+	}
+
+	if len(cleanupErrs) > 0 {
+		return cleanupErrs
 	}
 	return nil
 }
 
+type multiError []error
+
+func (m multiError) Error() string {
+	if len(m) == 0 {
+		return "<no error>"
+	}
+	if len(m) == 1 {
+		return m[0].Error()
+	}
+	strs := make([]string, 0, len(m))
+	for _, e := range m {
+		strs = append(strs, e.Error())
+	}
+	return strings.Join(strs, "; ")
+}
+
 func cloneRepo(ctx context.Context, repo, branch, rev string, depth int, gitRoot string) error {
-	args := []string{"clone", "--no-checkout", "-b", branch}
+	args := []string{"clone", "-v", "--no-checkout", "-b", branch}
 	if depth != 0 {
 		args = append(args, "--depth", strconv.Itoa(depth))
 	}
 	args = append(args, repo, gitRoot)
 	log.V(0).Info("cloning repo", "origin", repo, "path", gitRoot)
 
-	_, err := cmdRunner.Run(ctx, "", *flGitCmd, args...)
+	_, err := cmdRunner.Run(ctx, "", nil, *flGitCmd, args...)
 	if err != nil {
 		if strings.Contains(err.Error(), "already exists and is not an empty directory") {
 			// Maybe a previous run crashed?  Git won't use this dir.
 			log.V(0).Info("git root exists and is not empty (previous crash?), cleaning up", "path", gitRoot)
-			err := os.RemoveAll(gitRoot)
+			// We remove the contents rather than the dir itself, because a
+			// common use-case is to have a volume mounted at git.root, which
+			// makes removing it impossible.
+			err := removeDirContents(gitRoot, log)
 			if err != nil {
 				return err
 			}
-			_, err = cmdRunner.Run(ctx, "", *flGitCmd, args...)
+			_, err = cmdRunner.Run(ctx, "", nil, *flGitCmd, args...)
 			if err != nil {
 				return err
 			}
@@ -872,7 +976,7 @@ func cloneRepo(ctx context.Context, repo, branch, rev string, depth int, gitRoot
 		}
 
 		args := []string{"sparse-checkout", "init"}
-		_, err = cmdRunner.Run(ctx, gitRoot, *flGitCmd, args...)
+		_, err = cmdRunner.Run(ctx, gitRoot, nil, *flGitCmd, args...)
 		if err != nil {
 			return err
 		}
@@ -883,7 +987,7 @@ func cloneRepo(ctx context.Context, repo, branch, rev string, depth int, gitRoot
 
 // localHashForRev returns the locally known hash for a given rev.
 func localHashForRev(ctx context.Context, rev, gitRoot string) (string, error) {
-	output, err := cmdRunner.Run(ctx, gitRoot, *flGitCmd, "rev-parse", rev)
+	output, err := cmdRunner.Run(ctx, gitRoot, nil, *flGitCmd, "rev-parse", rev)
 	if err != nil {
 		return "", err
 	}
@@ -891,8 +995,8 @@ func localHashForRev(ctx context.Context, rev, gitRoot string) (string, error) {
 }
 
 // remoteHashForRef returns the upstream hash for a given ref.
-func remoteHashForRef(ctx context.Context, ref, gitRoot string) (string, error) {
-	output, err := cmdRunner.Run(ctx, gitRoot, *flGitCmd, "ls-remote", "-q", "origin", ref)
+func remoteHashForRef(ctx context.Context, repo, ref, gitRoot string) (string, error) {
+	output, err := cmdRunner.Run(ctx, gitRoot, nil, *flGitCmd, "ls-remote", "-q", repo, ref)
 	if err != nil {
 		return "", err
 	}
@@ -902,7 +1006,7 @@ func remoteHashForRef(ctx context.Context, ref, gitRoot string) (string, error) 
 
 func revIsHash(ctx context.Context, rev, gitRoot string) (bool, error) {
 	// If git doesn't identify rev as a commit, we're done.
-	output, err := cmdRunner.Run(ctx, gitRoot, *flGitCmd, "cat-file", "-t", rev)
+	output, err := cmdRunner.Run(ctx, gitRoot, nil, *flGitCmd, "cat-file", "-t", rev)
 	if err != nil {
 		return false, err
 	}
@@ -935,10 +1039,9 @@ func syncRepo(ctx context.Context, repo, branch, rev string, depth int, gitRoot,
 		askpassCount.WithLabelValues(metricKeySuccess).Inc()
 	}
 
-	target := filepath.Join(gitRoot, dest)
-	gitRepoPath := filepath.Join(target, ".git")
+	currentWorktreeGit := filepath.Join(dest, ".git")
 	var hash string
-	_, err := os.Stat(gitRepoPath)
+	_, err := os.Stat(currentWorktreeGit)
 	switch {
 	case os.IsNotExist(err):
 		// First time. Just clone it and get the hash.
@@ -951,10 +1054,10 @@ func syncRepo(ctx context.Context, repo, branch, rev string, depth int, gitRoot,
 			return false, "", err
 		}
 	case err != nil:
-		return false, "", fmt.Errorf("error checking if repo exists %q: %v", gitRepoPath, err)
+		return false, "", fmt.Errorf("error checking if a worktree exists %q: %v", currentWorktreeGit, err)
 	default:
 		// Not the first time. Figure out if the ref has changed.
-		local, remote, err := getRevs(ctx, target, branch, rev)
+		local, remote, err := getRevs(ctx, repo, dest, branch, rev)
 		if err != nil {
 			return false, "", err
 		}
@@ -966,11 +1069,11 @@ func syncRepo(ctx context.Context, repo, branch, rev string, depth int, gitRoot,
 		hash = remote
 	}
 
-	return true, hash, addWorktreeAndSwap(ctx, gitRoot, dest, branch, rev, depth, hash, submoduleMode)
+	return true, hash, addWorktreeAndSwap(ctx, repo, gitRoot, dest, branch, rev, depth, hash, submoduleMode)
 }
 
 // getRevs returns the local and upstream hashes for rev.
-func getRevs(ctx context.Context, localDir, branch, rev string) (string, string, error) {
+func getRevs(ctx context.Context, repo, localDir, branch, rev string) (string, string, error) {
 	// Ask git what the exact hash is for rev.
 	local, err := localHashForRev(ctx, rev, localDir)
 	if err != nil {
@@ -986,7 +1089,7 @@ func getRevs(ctx context.Context, localDir, branch, rev string) (string, string,
 	}
 
 	// Figure out what hash the remote resolves ref to.
-	remote, err := remoteHashForRef(ctx, ref, localDir)
+	remote, err := remoteHashForRef(ctx, repo, ref, localDir)
 	if err != nil {
 		return "", "", err
 	}
@@ -997,13 +1100,13 @@ func getRevs(ctx context.Context, localDir, branch, rev string) (string, string,
 func setupGitAuth(ctx context.Context, username, password, gitURL string) error {
 	log.V(1).Info("setting up git credential store")
 
-	_, err := cmdRunner.Run(ctx, "", *flGitCmd, "config", "--global", "credential.helper", "store")
+	_, err := cmdRunner.Run(ctx, "", nil, *flGitCmd, "config", "--global", "credential.helper", "store")
 	if err != nil {
 		return fmt.Errorf("can't configure git credential helper: %w", err)
 	}
 
 	creds := fmt.Sprintf("url=%v\nusername=%v\npassword=%v\n", gitURL, username, password)
-	_, err = cmdRunner.RunWithStdin(ctx, "", creds, *flGitCmd, "credential", "approve")
+	_, err = cmdRunner.RunWithStdin(ctx, "", nil, creds, *flGitCmd, "credential", "approve")
 	if err != nil {
 		return fmt.Errorf("can't configure git credentials: %w", err)
 	}
@@ -1027,9 +1130,9 @@ func setupGitSSH(setupKnownHosts bool) error {
 		if err != nil {
 			return fmt.Errorf("can't access SSH known_hosts: %w", err)
 		}
-		err = os.Setenv("GIT_SSH_COMMAND", fmt.Sprintf("ssh -q -o UserKnownHostsFile=%s -i %s", pathToSSHKnownHosts, pathToSSHSecret))
+		err = os.Setenv("GIT_SSH_COMMAND", fmt.Sprintf("ssh -o UserKnownHostsFile=%s -i %s", pathToSSHKnownHosts, pathToSSHSecret))
 	} else {
-		err = os.Setenv("GIT_SSH_COMMAND", fmt.Sprintf("ssh -q -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -i %s", pathToSSHSecret))
+		err = os.Setenv("GIT_SSH_COMMAND", fmt.Sprintf("ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -i %s", pathToSSHSecret))
 	}
 
 	// set env variable GIT_SSH_COMMAND to force git use customized ssh command
@@ -1050,7 +1153,7 @@ func setupGitCookieFile(ctx context.Context) error {
 		return fmt.Errorf("can't access git cookiefile: %w", err)
 	}
 
-	if _, err = cmdRunner.Run(ctx, "", *flGitCmd, "config", "--global", "http.cookiefile", pathToCookieFile); err != nil {
+	if _, err = cmdRunner.Run(ctx, "", nil, *flGitCmd, "config", "--global", "http.cookiefile", pathToCookieFile); err != nil {
 		return fmt.Errorf("can't configure git cookiefile: %w", err)
 	}
 
@@ -1115,6 +1218,24 @@ func callGitAskPassURL(ctx context.Context, url string) error {
 	return nil
 }
 
+func setupDefaultGitConfigs(ctx context.Context) error {
+	configs := []keyVal{{
+		// Never auto-detach GC runs.
+		key: "gc.autoDetach",
+		val: "false",
+	}, {
+		// Fairly aggressive GC.
+		key: "gc.pruneExpire",
+		val: "now",
+	}}
+	for _, kv := range configs {
+		if _, err := cmdRunner.Run(ctx, "", nil, *flGitCmd, "config", "--global", kv.key, kv.val); err != nil {
+			return fmt.Errorf("error configuring git %q %q: %v", kv.key, kv.val, err)
+		}
+	}
+	return nil
+}
+
 func setupExtraGitConfigs(ctx context.Context, configsFlag string) error {
 	log.V(1).Info("setting additional git configs")
 
@@ -1123,7 +1244,7 @@ func setupExtraGitConfigs(ctx context.Context, configsFlag string) error {
 		return fmt.Errorf("can't parse --git-config flag: %v", err)
 	}
 	for _, kv := range configs {
-		if _, err := cmdRunner.Run(ctx, "", *flGitCmd, "config", "--global", kv.key, kv.val); err != nil {
+		if _, err := cmdRunner.Run(ctx, "", nil, *flGitCmd, "config", "--global", kv.key, kv.val); err != nil {
 			return fmt.Errorf("error configuring additional git configs %q %q: %v", kv.key, kv.val, err)
 		}
 	}

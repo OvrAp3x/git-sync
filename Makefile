@@ -36,12 +36,12 @@ ALL_PLATFORMS := linux/amd64 linux/arm linux/arm64 linux/ppc64le linux/s390x
 OS := $(if $(GOOS),$(GOOS),$(shell go env GOOS))
 ARCH := $(if $(GOARCH),$(GOARCH),$(shell go env GOARCH))
 
-BASEIMAGE ?= k8s.gcr.io/build-image/debian-base:buster-v1.8.0
+BASEIMAGE ?= k8s.gcr.io/build-image/debian-base:buster-v1.10.0
 
 IMAGE := $(REGISTRY)/$(BIN)
 TAG := $(VERSION)__$(OS)_$(ARCH)
 
-BUILD_IMAGE ?= golang:1.15-alpine
+BUILD_IMAGE ?= golang:1.17-alpine
 
 # If you want to build all binaries, see the 'all-build' rule.
 # If you want to build all containers, see the 'all-container' rule.
@@ -192,9 +192,13 @@ test: $(BUILD_DIRS)
 	    "
 	@./test_e2e.sh
 
-test-tools:
-	@docker build -t $(REGISTRY)/test/test-sshd _test_tools/sshd
-	@docker build -t $(REGISTRY)/test/test-ncsvr _test_tools/ncsvr
+TEST_TOOLS := $(shell ls _test_tools)
+test-tools: $(foreach tool, $(TEST_TOOLS), .container.test_tool.$(tool))
+
+.container.test_tool.%: _test_tools/% _test_tools/%/*
+	@docker build -t $(REGISTRY)/test/$$(basename $<) $<
+	@docker images -q $(REGISTRY)/test/$$(basename $<) > $@
+
 
 # Help set up multi-arch build tools.  This assumes you have the tools
 # installed.  If you already have a buildx builder available, you don't need

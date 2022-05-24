@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# Copyright 2020 The Kubernetes Authors.
+# Copyright 2021 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,9 +17,6 @@
 # Use for e2e test of --exechook-command.
 # This option takes no command arguments, so requires a wrapper script.
 
-if [ -z "${GITSYNC_HASH}" ]; then
-    echo "GITSYNC_HASH is not set" > exechook
-    exit 1
-fi
-cat file > exechook
-cat ../link/file > link-exechook
+sleep 3
+date >> /var/log/runs
+exit 1
